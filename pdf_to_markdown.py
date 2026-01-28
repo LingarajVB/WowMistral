@@ -5,8 +5,17 @@ PDF to Markdown Converter using Mistral OCR API
 This script converts PDF documents to Markdown format using Mistral's
 Document AI OCR processor (mistral-ocr-latest model).
 
+Features:
+    - Single file or folder processing
+    - Automatic PDF splitting for files >= 50 MB
+    - Rate limiting with configurable sleep timer
+    - Processing log to avoid duplicate API calls
+    - Double confirmation for output paths
+    - Optional image preservation
+    - Progress tracking
+
 Requirements:
-    pip install mistralai
+    pip install mistralai PyPDF2
 
 Usage:
     python pdf_to_markdown.py
@@ -16,9 +25,14 @@ Environment Variables:
 """
 
 import os
+import re
 import sys
+import json
+import time
 import base64
+import tempfile
 from pathlib import Path
+from datetime import datetime
 
 try:
     from mistralai import Mistral
@@ -27,10 +41,26 @@ except ImportError:
     print("Please install it using: pip install mistralai")
     sys.exit(1)
 
+try:
+    from PyPDF2 import PdfReader, PdfWriter
+except ImportError:
+    print("Error: PyPDF2 package not installed.")
+    print("Please install it using: pip install PyPDF2")
+    sys.exit(1)
+
 
 # Maximum file size in bytes (50 MB)
 MAX_FILE_SIZE_MB = 50
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Maximum pages per API request (Mistral limit is 1000)
+MAX_PAGES_PER_REQUEST = 1000
+
+# Log file name
+PROCESSING_LOG_FILE = "pdf_processing_log.json"
+
+# Images subfolder name
+IMAGES_FOLDER = "images"
 
 
 def get_file_size_mb(file_path: str) -> float:
@@ -39,36 +69,199 @@ def get_file_size_mb(file_path: str) -> float:
     return size_bytes / (1024 * 1024)
 
 
-def validate_pdf_file(file_path: str) -> tuple[bool, str]:
+def get_file_size_bytes(file_path: str) -> int:
+    """Get file size in bytes."""
+    return os.path.getsize(file_path)
+
+
+def load_processing_log(output_dir: str) -> dict:
+    """Load the processing log from the output directory."""
+    log_path = os.path.join(output_dir, PROCESSING_LOG_FILE)
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {"processed_files": {}}
+    return {"processed_files": {}}
+
+
+def save_processing_log(output_dir: str, log_data: dict) -> None:
+    """Save the processing log to the output directory."""
+    log_path = os.path.join(output_dir, PROCESSING_LOG_FILE)
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(log_data, f, indent=2)
+
+
+def is_already_processed(log_data: dict, pdf_path: str, output_path: str) -> bool:
+    """Check if a PDF has already been processed and output exists."""
+    pdf_name = os.path.basename(pdf_path)
+    if pdf_name in log_data.get("processed_files", {}):
+        entry = log_data["processed_files"][pdf_name]
+        # Check if all output files exist
+        output_files = entry.get("output_files", [])
+        if output_files and all(os.path.exists(f) for f in output_files):
+            return True
+    return False
+
+
+def log_processed_file(log_data: dict, pdf_path: str, output_files: list, pages: int, images_saved: int = 0) -> None:
+    """Log a processed file."""
+    pdf_name = os.path.basename(pdf_path)
+    log_data["processed_files"][pdf_name] = {
+        "source_path": pdf_path,
+        "output_files": output_files,
+        "pages_processed": pages,
+        "images_saved": images_saved,
+        "processed_at": datetime.now().isoformat(),
+        "file_size_mb": get_file_size_mb(pdf_path)
+    }
+
+
+def validate_path(file_path: str) -> tuple[bool, bool, str]:
     """
-    Validate the input PDF file.
+    Validate the input path (file or directory).
     
     Returns:
-        tuple: (is_valid, error_message)
+        tuple: (is_valid, is_directory, error_message)
     """
     path = Path(file_path)
     
-    # Check if file exists
+    # Check if path exists
     if not path.exists():
-        return False, f"File not found: {file_path}"
+        return False, False, f"Path not found: {file_path}"
     
-    # Check if it's a file (not a directory)
-    if not path.is_file():
-        return False, f"Path is not a file: {file_path}"
+    # Check if it's a directory
+    if path.is_dir():
+        return True, True, ""
     
-    # Check file extension
-    if path.suffix.lower() != '.pdf':
-        return False, f"File is not a PDF: {file_path} (extension: {path.suffix})"
+    # Check if it's a file with PDF extension
+    if path.is_file():
+        if path.suffix.lower() != '.pdf':
+            return False, False, f"File is not a PDF: {file_path} (extension: {path.suffix})"
+        return True, False, ""
     
-    # Check file size
-    size_mb = get_file_size_mb(file_path)
+    return False, False, f"Invalid path: {file_path}"
+
+
+def get_pdf_files_from_folder(folder_path: str) -> list[str]:
+    """Get all PDF files from a folder."""
+    pdf_files = []
+    for file in os.listdir(folder_path):
+        if file.lower().endswith('.pdf'):
+            pdf_files.append(os.path.join(folder_path, file))
+    return sorted(pdf_files)
+
+
+def get_pdf_page_count(pdf_path: str) -> int:
+    """Get the number of pages in a PDF file."""
+    try:
+        reader = PdfReader(pdf_path)
+        return len(reader.pages)
+    except:
+        return 0
+
+
+def check_if_needs_split(pdf_path: str) -> tuple[bool, str]:
+    """
+    Check if a PDF needs to be split.
+    
+    Returns:
+        tuple: (needs_split, reason_string)
+    """
+    size_mb = get_file_size_mb(pdf_path)
+    page_count = get_pdf_page_count(pdf_path)
+    
+    reasons = []
     if size_mb >= MAX_FILE_SIZE_MB:
-        return False, (
-            f"File size ({size_mb:.2f} MB) exceeds the maximum allowed size "
-            f"of {MAX_FILE_SIZE_MB} MB. Please use a smaller file."
-        )
+        reasons.append(f">{MAX_FILE_SIZE_MB}MB")
+    if page_count > MAX_PAGES_PER_REQUEST:
+        reasons.append(f">{MAX_PAGES_PER_REQUEST} pages")
     
-    return True, ""
+    if reasons:
+        return True, f" (will be split: {', '.join(reasons)})"
+    return False, ""
+
+def split_pdf_if_needed(pdf_path: str, max_size_bytes: int = MAX_FILE_SIZE_BYTES, max_pages: int = MAX_PAGES_PER_REQUEST) -> list[str]:
+    """
+    Split a PDF into smaller chunks based on file size OR page count.
+    
+    Splits if:
+    - File size >= max_size_bytes (default 50 MB)
+    - Page count > max_pages (default 1000 pages, Mistral API limit)
+    
+    Returns a list of paths to the split PDF files (temporary files).
+    If the file is already under both limits, returns a list with just the original path.
+    """
+    file_size = get_file_size_bytes(pdf_path)
+    
+    # Read PDF to get page count
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+    
+    # Check if splitting is needed
+    needs_size_split = file_size >= max_size_bytes
+    needs_page_split = total_pages > max_pages
+    
+    if not needs_size_split and not needs_page_split:
+        return [pdf_path]
+    
+    # Determine reason for split
+    split_reasons = []
+    if needs_size_split:
+        split_reasons.append(f"{get_file_size_mb(pdf_path):.2f} MB > {MAX_FILE_SIZE_MB} MB")
+    if needs_page_split:
+        split_reasons.append(f"{total_pages} pages > {max_pages} page limit")
+    
+    print(f"  PDF needs splitting ({', '.join(split_reasons)})...")
+    
+    # Calculate pages per chunk considering both limits
+    avg_page_size = file_size / total_pages if total_pages > 0 else 0
+    
+    # Pages per chunk based on size limit (use 90% to be safe)
+    if avg_page_size > 0:
+        pages_by_size = max(1, int((max_size_bytes * 0.9) / avg_page_size))
+    else:
+        pages_by_size = max_pages
+    
+    # Pages per chunk based on page limit (use 90% to be safe)
+    pages_by_count = int(max_pages * 0.9)
+    
+    # Use the smaller of the two limits
+    pages_per_chunk = min(pages_by_size, pages_by_count)
+    
+    chunks = []
+    chunk_num = 1
+    temp_dir = tempfile.mkdtemp(prefix="pdf_split_")
+    
+    for start_page in range(0, total_pages, pages_per_chunk):
+        end_page = min(start_page + pages_per_chunk, total_pages)
+        
+        writer = PdfWriter()
+        for page_num in range(start_page, end_page):
+            writer.add_page(reader.pages[page_num])
+        
+        # Write chunk to temp file
+        base_name = Path(pdf_path).stem
+        chunk_path = os.path.join(temp_dir, f"{base_name}_part{chunk_num}.pdf")
+        
+        with open(chunk_path, 'wb') as f:
+            writer.write(f)
+        
+        # Check if chunk is still too large, reduce pages if needed
+        chunk_size = get_file_size_bytes(chunk_path)
+        if chunk_size >= max_size_bytes and end_page - start_page > 1:
+            # Chunk is too large, we need to reduce pages
+            os.remove(chunk_path)
+            # Recursively split with fewer pages
+            pages_per_chunk = max(1, pages_per_chunk // 2)
+            continue
+        
+        chunks.append(chunk_path)
+        print(f"    Created chunk {chunk_num}: pages {start_page + 1}-{end_page} ({get_file_size_mb(chunk_path):.2f} MB)")
+        chunk_num += 1
+    
+    return chunks
 
 
 def encode_pdf_to_base64(file_path: str) -> str:
@@ -77,13 +270,14 @@ def encode_pdf_to_base64(file_path: str) -> str:
         return base64.standard_b64encode(f.read()).decode('utf-8')
 
 
-def process_pdf_with_ocr(client: Mistral, pdf_path: str) -> dict:
+def process_pdf_with_ocr(client: Mistral, pdf_path: str, include_images: bool = True) -> dict:
     """
     Process a PDF file using Mistral OCR API.
     
     Args:
         client: Mistral client instance
         pdf_path: Path to the PDF file
+        include_images: Whether to include image data in the response
         
     Returns:
         dict: OCR response containing extracted content
@@ -101,18 +295,112 @@ def process_pdf_with_ocr(client: Mistral, pdf_path: str) -> dict:
             "type": "document_url",
             "document_url": document_url
         },
-        include_image_base64=True
+        include_image_base64=include_images
     )
     
     return ocr_response
 
 
-def extract_markdown_from_response(ocr_response) -> str:
+def save_images_from_response(ocr_response, output_dir: str, pdf_base_name: str) -> dict:
+    """
+    Save images from OCR response to files.
+    
+    Args:
+        ocr_response: OCR API response object
+        output_dir: Directory to save images
+        pdf_base_name: Base name of the PDF file (used for image naming)
+        
+    Returns:
+        dict: Mapping of original image references to saved file paths
+    """
+    image_mapping = {}
+    images_dir = os.path.join(output_dir, IMAGES_FOLDER, pdf_base_name)
+    
+    # Create images directory
+    Path(images_dir).mkdir(parents=True, exist_ok=True)
+    
+    for page in ocr_response.pages:
+        if not hasattr(page, 'images') or not page.images:
+            continue
+            
+        for img in page.images:
+            # Get image ID and base64 data
+            img_id = getattr(img, 'id', None)
+            img_base64 = getattr(img, 'image_base64', None)
+            
+            if not img_id or not img_base64:
+                continue
+            
+            # Determine file extension from the image ID or default to png
+            # Image IDs are typically like "img-0.jpeg", "img-1.png", etc.
+            if '.' in img_id:
+                ext = img_id.split('.')[-1].lower()
+            else:
+                ext = 'png'
+            
+            # Clean the image ID for use as filename
+            safe_img_id = re.sub(r'[^\w\-.]', '_', img_id)
+            img_filename = f"page{page.index + 1}_{safe_img_id}"
+            if not img_filename.endswith(f'.{ext}'):
+                img_filename = f"{img_filename}.{ext}"
+            
+            img_path = os.path.join(images_dir, img_filename)
+            
+            try:
+                # Decode and save image
+                # Handle data URI format if present
+                if ',' in img_base64:
+                    img_base64 = img_base64.split(',')[1]
+                
+                img_data = base64.b64decode(img_base64)
+                with open(img_path, 'wb') as f:
+                    f.write(img_data)
+                
+                # Create relative path for markdown
+                relative_path = os.path.join(IMAGES_FOLDER, pdf_base_name, img_filename)
+                image_mapping[img_id] = relative_path
+                
+            except Exception as e:
+                print(f"    ⚠️  Failed to save image {img_id}: {e}")
+    
+    return image_mapping
+
+
+def update_markdown_with_images(markdown: str, image_mapping: dict) -> str:
+    """
+    Update markdown content to reference saved image files.
+    
+    Args:
+        markdown: Original markdown content
+        image_mapping: Mapping of original image references to saved file paths
+        
+    Returns:
+        str: Updated markdown with correct image paths
+    """
+    updated_markdown = markdown
+    
+    for original_ref, new_path in image_mapping.items():
+        # Replace image references like ![img-0.jpeg](img-0.jpeg)
+        # with ![img-0.jpeg](images/pdf_name/page1_img-0.jpeg)
+        pattern = rf'!\[([^\]]*)\]\({re.escape(original_ref)}\)'
+        replacement = f'![\\1]({new_path})'
+        updated_markdown = re.sub(pattern, replacement, updated_markdown)
+        
+        # Also handle cases where just the filename is referenced
+        pattern2 = rf'\]\({re.escape(original_ref)}\)'
+        replacement2 = f']({new_path})'
+        updated_markdown = re.sub(pattern2, replacement2, updated_markdown)
+    
+    return updated_markdown
+
+
+def extract_markdown_from_response(ocr_response, image_mapping: dict = None) -> str:
     """
     Extract and combine markdown content from all pages.
     
     Args:
         ocr_response: OCR API response object
+        image_mapping: Optional mapping of image references to file paths
         
     Returns:
         str: Combined markdown content from all pages
@@ -127,7 +415,13 @@ def extract_markdown_from_response(ocr_response) -> str:
             markdown_parts.append(f"<!-- Page {page.index + 1} -->\n\n")
         
         # Add the markdown content
-        markdown_parts.append(page.markdown)
+        page_markdown = page.markdown
+        
+        # Update image references if mapping provided
+        if image_mapping:
+            page_markdown = update_markdown_with_images(page_markdown, image_mapping)
+        
+        markdown_parts.append(page_markdown)
     
     return "".join(markdown_parts)
 
@@ -139,6 +433,157 @@ def save_markdown(content: str, output_path: str) -> None:
     
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(content)
+
+
+def get_output_path_for_pdf(pdf_path: str, output_dir: str, part_num: int = None) -> str:
+    """Generate output path for a PDF file."""
+    base_name = Path(pdf_path).stem
+    
+    # Remove _partN suffix if present (for split files)
+    if "_part" in base_name:
+        # Keep the part suffix from the split file
+        pass
+    elif part_num is not None:
+        base_name = f"{base_name}_part{part_num}"
+    
+    return os.path.join(output_dir, f"{base_name}.md")
+
+
+def double_confirm_output_path(output_path: str) -> bool:
+    """Ask for double confirmation of the output path."""
+    print(f"\n{'='*60}")
+    print("OUTPUT PATH CONFIRMATION")
+    print(f"{'='*60}")
+    print(f"Output will be saved to: {output_path}")
+    
+    confirm1 = input("\nConfirm this output path? (yes/no): ").strip().lower()
+    if confirm1 not in ['yes', 'y']:
+        return False
+    
+    confirm2 = input("Please confirm again to proceed (yes/no): ").strip().lower()
+    if confirm2 not in ['yes', 'y']:
+        return False
+    
+    return True
+
+
+def print_progress(current: int, total: int, prefix: str = "Progress") -> None:
+    """Print a progress indicator."""
+    percentage = (current / total) * 100 if total > 0 else 0
+    bar_length = 30
+    filled = int(bar_length * current / total) if total > 0 else 0
+    bar = '█' * filled + '░' * (bar_length - filled)
+    print(f"\n{prefix}: [{bar}] {current}/{total} ({percentage:.1f}%)")
+
+
+def process_single_pdf(
+    client: Mistral,
+    pdf_path: str,
+    output_dir: str,
+    log_data: dict,
+    sleep_seconds: float,
+    preserve_images: bool = False,
+    current_file: int = 1,
+    total_files: int = 1
+) -> tuple[list[str], int, int]:
+    """
+    Process a single PDF file, handling splitting if needed.
+    
+    Returns:
+        tuple: (list of output file paths, total pages processed, images saved)
+    """
+    pdf_name = os.path.basename(pdf_path)
+    size_mb = get_file_size_mb(pdf_path)
+    
+    print_progress(current_file, total_files, "Overall Progress")
+    print(f"Processing: {pdf_name} ({size_mb:.2f} MB)")
+    
+    # Check if already processed
+    base_output = get_output_path_for_pdf(pdf_path, output_dir)
+    if is_already_processed(log_data, pdf_path, base_output):
+        print(f"  ⏭️  Already processed (found in log). Skipping...")
+        entry = log_data["processed_files"][pdf_name]
+        return entry.get("output_files", []), entry.get("pages_processed", 0), entry.get("images_saved", 0)
+    
+    # Split PDF if needed
+    pdf_chunks = split_pdf_if_needed(pdf_path)
+    is_split = len(pdf_chunks) > 1
+    
+    output_files = []
+    total_pages = 0
+    total_images = 0
+    
+    for i, chunk_path in enumerate(pdf_chunks):
+        chunk_num = i + 1 if is_split else None
+        
+        # Determine output path
+        if is_split:
+            # Use the chunk filename which already has _partN
+            output_path = get_output_path_for_pdf(chunk_path, output_dir)
+            pdf_base_name = Path(chunk_path).stem
+        else:
+            output_path = get_output_path_for_pdf(pdf_path, output_dir)
+            pdf_base_name = Path(pdf_path).stem
+        
+        # Check if this specific output already exists
+        if os.path.exists(output_path):
+            print(f"  ⏭️  Output already exists: {os.path.basename(output_path)}. Skipping...")
+            output_files.append(output_path)
+            continue
+        
+        chunk_info = f"chunk {chunk_num}/{len(pdf_chunks)}" if is_split else "file"
+        print(f"  📄 Processing {chunk_info}...")
+        
+        try:
+            # Process with OCR
+            ocr_response = process_pdf_with_ocr(client, chunk_path, include_images=preserve_images)
+            
+            # Save images if requested
+            image_mapping = {}
+            images_saved = 0
+            if preserve_images:
+                print(f"  🖼️  Extracting images...")
+                image_mapping = save_images_from_response(ocr_response, output_dir, pdf_base_name)
+                images_saved = len(image_mapping)
+                if images_saved > 0:
+                    print(f"  ✅ Saved {images_saved} image(s)")
+                else:
+                    print(f"  ℹ️  No images found in this document")
+            
+            # Extract markdown
+            markdown_content = extract_markdown_from_response(ocr_response, image_mapping)
+            
+            # Save output
+            save_markdown(markdown_content, output_path)
+            output_files.append(output_path)
+            total_pages += len(ocr_response.pages)
+            total_images += images_saved
+            
+            print(f"  ✅ Saved: {os.path.basename(output_path)} ({len(ocr_response.pages)} pages)")
+            
+            # Sleep to avoid rate limiting (don't sleep after the last chunk)
+            if sleep_seconds > 0 and (i < len(pdf_chunks) - 1):
+                print(f"  ⏳ Sleeping {sleep_seconds}s to avoid rate limiting...")
+                time.sleep(sleep_seconds)
+                
+        except Exception as e:
+            print(f"  ❌ Error processing: {e}")
+            continue
+    
+    # Clean up temporary split files
+    if is_split:
+        for chunk_path in pdf_chunks:
+            if os.path.exists(chunk_path) and chunk_path != pdf_path:
+                try:
+                    os.remove(chunk_path)
+                except:
+                    pass
+    
+    # Log the processed file
+    if output_files:
+        log_processed_file(log_data, pdf_path, output_files, total_pages, total_images)
+    
+    return output_files, total_pages, total_images
 
 
 def main():
@@ -155,10 +600,12 @@ def main():
         print("Please set it using: export MISTRAL_API_KEY='your-api-key'")
         sys.exit(1)
     
-    # Get input PDF path
-    print(f"Note: Maximum file size allowed is {MAX_FILE_SIZE_MB} MB")
+    # Get input path
+    print("You can provide either:")
+    print("  - A single PDF file path")
+    print("  - A folder path (to process all PDFs in it)")
     print()
-    input_path = input("Enter the input PDF file path: ").strip()
+    input_path = input("Enter the input path: ").strip()
     
     # Remove quotes if present (common when dragging files)
     input_path = input_path.strip('"').strip("'")
@@ -166,19 +613,42 @@ def main():
     # Expand user home directory if present
     input_path = os.path.expanduser(input_path)
     
-    # Validate input file
-    is_valid, error_msg = validate_pdf_file(input_path)
+    # Validate input path
+    is_valid, is_directory, error_msg = validate_path(input_path)
     if not is_valid:
         print(f"\nError: {error_msg}")
         sys.exit(1)
     
-    # Show file info
-    size_mb = get_file_size_mb(input_path)
-    print(f"\nFile size: {size_mb:.2f} MB ✓")
+    # Get list of PDF files to process
+    if is_directory:
+        pdf_files = get_pdf_files_from_folder(input_path)
+        if not pdf_files:
+            print(f"\nNo PDF files found in folder: {input_path}")
+            sys.exit(1)
+        
+        print(f"\n📁 FOLDER INPUT DETECTED")
+        print(f"Found {len(pdf_files)} PDF file(s) in the folder:")
+        total_size = 0
+        for pdf in pdf_files:
+            size = get_file_size_mb(pdf)
+            total_size += size
+            _, needs_split = check_if_needs_split(pdf)
+            print(f"  • {os.path.basename(pdf)} ({size:.2f} MB){needs_split}")
+        print(f"\nTotal size: {total_size:.2f} MB")
+        
+        proceed = input("\nDo you want to process all these files? (yes/no): ").strip().lower()
+        if proceed not in ['yes', 'y']:
+            print("Operation cancelled.")
+            sys.exit(0)
+    else:
+        pdf_files = [input_path]
+        size_mb = get_file_size_mb(input_path)
+        _, needs_split = check_if_needs_split(input_path)
+        print(f"\n📄 Single file: {size_mb:.2f} MB{needs_split}")
     
-    # Get output path
+    # Get output directory
     print()
-    output_path = input("Enter the output Markdown file path: ").strip()
+    output_path = input("Enter the output directory path: ").strip()
     
     # Remove quotes if present
     output_path = output_path.strip('"').strip("'")
@@ -186,45 +656,112 @@ def main():
     # Expand user home directory if present
     output_path = os.path.expanduser(output_path)
     
-    # Ensure output has .md extension
-    if not output_path.lower().endswith('.md'):
-        output_path += '.md'
+    # Ensure output path is a directory
+    if os.path.exists(output_path) and not os.path.isdir(output_path):
+        print(f"\nError: Output path exists but is not a directory: {output_path}")
+        sys.exit(1)
     
-    # Check if output file already exists
-    if os.path.exists(output_path):
-        overwrite = input(f"\nFile '{output_path}' already exists. Overwrite? (y/n): ").strip().lower()
-        if overwrite != 'y':
-            print("Operation cancelled.")
-            sys.exit(0)
+    # Double confirmation for output path
+    if not double_confirm_output_path(output_path):
+        print("Operation cancelled.")
+        sys.exit(0)
+    
+    # Create output directory if it doesn't exist
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    
+    # Ask about image preservation
+    print()
+    preserve_images_input = input("Preserve images from PDFs? (yes/no, default: no): ").strip().lower()
+    preserve_images = preserve_images_input in ['yes', 'y']
+    if preserve_images:
+        print(f"  ✓ Images will be saved to: {os.path.join(output_path, IMAGES_FOLDER)}/")
+    
+    # Get sleep timer
+    print()
+    sleep_input = input("Enter sleep time between API calls in seconds (default: 1): ").strip()
+    try:
+        sleep_seconds = float(sleep_input) if sleep_input else 1.0
+    except ValueError:
+        print("Invalid number, using default of 1 second.")
+        sleep_seconds = 1.0
+    
+    # Load processing log
+    log_data = load_processing_log(output_path)
+    
+    # Check for already processed files
+    already_processed = []
+    to_process = []
+    for pdf in pdf_files:
+        base_output = get_output_path_for_pdf(pdf, output_path)
+        if is_already_processed(log_data, pdf, base_output):
+            already_processed.append(pdf)
+        else:
+            to_process.append(pdf)
+    
+    if already_processed:
+        print(f"\n⏭️  {len(already_processed)} file(s) already processed (will be skipped):")
+        for pdf in already_processed:
+            print(f"  • {os.path.basename(pdf)}")
+    
+    if not to_process:
+        print("\n✅ All files have already been processed!")
+        sys.exit(0)
+    
+    print(f"\n📝 {len(to_process)} file(s) to process:")
+    for pdf in to_process:
+        print(f"  • {os.path.basename(pdf)}")
     
     # Initialize Mistral client
     print("\nInitializing Mistral client...")
     client = Mistral(api_key=api_key)
     
-    # Process the PDF
-    print(f"Processing PDF with OCR (this may take a moment)...")
-    try:
-        ocr_response = process_pdf_with_ocr(client, input_path)
-    except Exception as e:
-        print(f"\nError during OCR processing: {e}")
-        sys.exit(1)
+    # Process all PDFs
+    print("\n" + "=" * 60)
+    print("STARTING PROCESSING")
+    print("=" * 60)
     
-    # Extract markdown
-    print("Extracting markdown content...")
-    markdown_content = extract_markdown_from_response(ocr_response)
+    total_files_processed = 0
+    total_pages_processed = 0
+    total_images_saved = 0
+    all_output_files = []
     
-    # Save to file
-    print(f"Saving to: {output_path}")
-    save_markdown(markdown_content, output_path)
+    for i, pdf_path in enumerate(pdf_files):
+        output_files, pages, images = process_single_pdf(
+            client, pdf_path, output_path, log_data, sleep_seconds,
+            preserve_images=preserve_images,
+            current_file=i + 1,
+            total_files=len(pdf_files)
+        )
+        
+        if output_files:
+            total_files_processed += 1
+            total_pages_processed += pages
+            total_images_saved += images
+            all_output_files.extend(output_files)
+        
+        # Save log after each file
+        save_processing_log(output_path, log_data)
+        
+        # Sleep between files (not after the last one)
+        if sleep_seconds > 0 and i < len(pdf_files) - 1 and pdf_path in to_process:
+            print(f"\n⏳ Sleeping {sleep_seconds}s before next file...")
+            time.sleep(sleep_seconds)
     
     # Print summary
     print()
     print("=" * 60)
-    print("Conversion Complete!")
+    print("CONVERSION COMPLETE!")
     print("=" * 60)
-    print(f"Input:  {input_path}")
-    print(f"Output: {output_path}")
-    print(f"Pages processed: {len(ocr_response.pages)}")
+    print(f"Files processed: {total_files_processed}")
+    print(f"Total pages: {total_pages_processed}")
+    if preserve_images:
+        print(f"Total images saved: {total_images_saved}")
+    print(f"Output directory: {output_path}")
+    print(f"Processing log: {os.path.join(output_path, PROCESSING_LOG_FILE)}")
+    print()
+    print("Output files:")
+    for f in all_output_files:
+        print(f"  • {os.path.basename(f)}")
     print()
 
 
