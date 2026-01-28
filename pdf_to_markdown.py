@@ -506,7 +506,13 @@ def process_single_pdf(
         return entry.get("output_files", []), entry.get("pages_processed", 0), entry.get("images_saved", 0)
     
     # Split PDF if needed
-    pdf_chunks = split_pdf_if_needed(pdf_path)
+    try:
+        pdf_chunks = split_pdf_if_needed(pdf_path)
+    except Exception as e:
+        print(f"  ❌ Error reading PDF (may be corrupted or use unsupported format): {e}")
+        print(f"  ⏭️  Skipping this file...")
+        return [], 0, 0
+    
     is_split = len(pdf_chunks) > 1
     
     output_files = []
