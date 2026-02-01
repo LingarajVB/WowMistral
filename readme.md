@@ -42,6 +42,7 @@ A Python tool that converts PDF documents to Markdown format using Mistral AI's 
 - ✅ **Rate limiting** - Configurable sleep timer between API calls to avoid rate limits
 - ✅ **Processing log** - Tracks processed files to avoid duplicate API calls (saves credits!)
 - ✅ **Image preservation** - Optionally extract and save images from PDFs
+- ✅ **Image annotation** - AI-powered classification with category, confidence, and reasoning
 - ✅ **Progress tracking** - Visual progress bar for batch processing
 - ✅ **Double confirmation** - Confirms output path before processing
 
@@ -130,7 +131,8 @@ The script will guide you through the process:
 2. **Output Directory**: Specify where to save the Markdown files
 3. **Confirm Output Path**: Double confirmation to prevent accidental overwrites
 4. **Preserve Images**: Choose whether to extract and save images (yes/no)
-5. **Sleep Timer**: Set delay between API calls (default: 1 second)
+5. **Annotate Images**: AI-powered image classification (category, confidence, reasoning)
+6. **Sleep Timer**: Set delay between API calls (default: 1 second)
 
 ### Example Session
 
@@ -166,6 +168,9 @@ Please confirm again to proceed (yes/no): yes
 Preserve images from PDFs? (yes/no, default: no): yes
   ✓ Images will be saved to: ./output/images/
 
+Annotate images with AI classification? (yes/no, default: no): yes
+  ✓ Images will be annotated with category, confidence, and reasoning
+
 Enter sleep time between API calls in seconds (default: 1): 2
 
 Initializing Mistral client...
@@ -179,6 +184,7 @@ Processing: document1.pdf (2.34 MB)
   📄 Processing file...
   🖼️  Extracting images...
   ✅ Saved 12 image(s)
+  📝 Generated 12 annotation(s)
   ✅ Saved: document1.md (45 pages)
 
 ...
@@ -224,6 +230,32 @@ The script maintains a `pdf_processing_log.json` file that tracks:
 - Processing timestamp
 
 **This prevents re-processing the same files and saves API credits!**
+
+---
+
+## 🖼️ Image Annotation Output
+
+When image annotation is enabled, each extracted image gets an AI-generated analysis block in the markdown:
+
+```markdown
+![img-0.jpeg](<images/document/page1_img-0.jpeg>)
+
+> **Image Analysis:**
+> - Category: informative
+> - Confidence: 0.92
+> - Reasoning: The image shows a bar chart presenting quarterly sales data with clear labels and a legend, making it informative content.
+```
+
+### Annotation Categories
+
+| Category | Description |
+|----------|-------------|
+| `neutral` | Content with no particular sentiment or bias |
+| `positive` | Content with positive sentiment or tone |
+| `negative` | Content with negative sentiment or tone |
+| `informative` | Charts, diagrams, or educational content |
+
+> **Note**: Image paths are wrapped in angle brackets `<>` to correctly render in markdown viewers even when filenames contain spaces.
 
 ---
 

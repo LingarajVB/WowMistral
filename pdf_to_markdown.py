@@ -48,6 +48,31 @@ except ImportError:
     print("Please install it using: pip install PyPDF2")
     sys.exit(1)
 
+# Check for pydantic (needed for image annotation)
+try:
+    from pydantic import BaseModel, Field
+    from enum import Enum
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+
+# Image annotation schema (only if pydantic is available)
+if PYDANTIC_AVAILABLE:
+    from mistralai.extra import response_format_from_pydantic_model
+    
+    class ImageCategory(str, Enum):
+        """Classification categories for image content."""
+        NEUTRAL = "neutral"
+        POSITIVE = "positive"
+        NEGATIVE = "negative"
+        INFORMATIVE = "informative"
+    
+    class ImageAnnotation(BaseModel):
+        """Structured annotation schema for extracted images."""
+        category: ImageCategory = Field(..., description="Classification category of the image content: neutral, positive, negative, or informative")
+        confidence: float = Field(..., description="Confidence score between 0.0 and 1.0 indicating how confident the model is in this classification")
+        reasoning: str = Field(..., description="Detailed explanation describing the image content and why this classification category was chosen")
+
 
 # Maximum file size in bytes (50 MB)
 MAX_FILE_SIZE_MB = 50
@@ -270,7 +295,7 @@ def encode_pdf_to_base64(file_path: str) -> str:
         return base64.standard_b64encode(f.read()).decode('utf-8')
 
 
-def process_pdf_with_ocr(client: Mistral, pdf_path: str, include_images: bool = True) -> dict:
+def process_pdf_with_ocr(client: Mistral, pdf_path: str, include_images: bool = True, annotate_images: bool = False) -> dict:
     """
     Process a PDF file using Mistral OCR API.
     
@@ -278,6 +303,7 @@ def process_pdf_with_ocr(client: Mistral, pdf_path: str, include_images: bool = 
         client: Mistral client instance
         pdf_path: Path to the PDF file
         include_images: Whether to include image data in the response
+        annotate_images: Whether to annotate images with classification
         
     Returns:
         dict: OCR response containing extracted content
@@ -288,20 +314,27 @@ def process_pdf_with_ocr(client: Mistral, pdf_path: str, include_images: bool = 
     # Create data URI for the PDF
     document_url = f"data:application/pdf;base64,{pdf_base64}"
     
-    # Process with OCR
-    ocr_response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
+    # Build OCR parameters
+    ocr_params = {
+        "model": "mistral-ocr-latest",
+        "document": {
             "type": "document_url",
             "document_url": document_url
         },
-        include_image_base64=include_images
-    )
+        "include_image_base64": include_images
+    }
+    
+    # Add image annotation if requested and pydantic is available
+    if annotate_images and include_images and PYDANTIC_AVAILABLE:
+        ocr_params["bbox_annotation_format"] = response_format_from_pydantic_model(ImageAnnotation)
+    
+    # Process with OCR
+    ocr_response = client.ocr.process(**ocr_params)
     
     return ocr_response
 
 
-def save_images_from_response(ocr_response, output_dir: str, pdf_base_name: str) -> dict:
+def save_images_from_response(ocr_response, output_dir: str, pdf_base_name: str) -> tuple[dict, dict]:
     """
     Save images from OCR response to files.
     
@@ -311,9 +344,12 @@ def save_images_from_response(ocr_response, output_dir: str, pdf_base_name: str)
         pdf_base_name: Base name of the PDF file (used for image naming)
         
     Returns:
-        dict: Mapping of original image references to saved file paths
+        tuple: (image_mapping dict, annotations dict)
+            - image_mapping: Mapping of original image references to saved file paths
+            - annotations: Mapping of image IDs to their annotation data
     """
     image_mapping = {}
+    annotations = {}
     images_dir = os.path.join(output_dir, IMAGES_FOLDER, pdf_base_name)
     
     # Create images directory
@@ -330,6 +366,18 @@ def save_images_from_response(ocr_response, output_dir: str, pdf_base_name: str)
             
             if not img_id or not img_base64:
                 continue
+            
+            # Get annotation if available
+            img_annotation = getattr(img, 'image_annotation', None)
+            if img_annotation:
+                try:
+                    # Parse JSON annotation string
+                    if isinstance(img_annotation, str):
+                        annotations[img_id] = json.loads(img_annotation)
+                    else:
+                        annotations[img_id] = img_annotation
+                except (json.JSONDecodeError, TypeError):
+                    pass
             
             # Determine file extension from the image ID or default to png
             # Image IDs are typically like "img-0.jpeg", "img-1.png", etc.
@@ -363,44 +411,56 @@ def save_images_from_response(ocr_response, output_dir: str, pdf_base_name: str)
             except Exception as e:
                 print(f"    ⚠️  Failed to save image {img_id}: {e}")
     
-    return image_mapping
+    return image_mapping, annotations
 
 
-def update_markdown_with_images(markdown: str, image_mapping: dict) -> str:
+def update_markdown_with_images(markdown: str, image_mapping: dict, annotations: dict = None) -> str:
     """
     Update markdown content to reference saved image files.
+    Uses angle brackets around paths to handle filenames with spaces.
     
     Args:
         markdown: Original markdown content
         image_mapping: Mapping of original image references to saved file paths
+        annotations: Optional mapping of image IDs to annotation data
         
     Returns:
-        str: Updated markdown with correct image paths
+        str: Updated markdown with correct image paths and optional annotations
     """
     updated_markdown = markdown
     
     for original_ref, new_path in image_mapping.items():
+        # Build annotation block if available
+        annotation_block = ""
+        if annotations and original_ref in annotations:
+            ann = annotations[original_ref]
+            category = ann.get('category', 'unknown')
+            confidence = ann.get('confidence', 0)
+            reasoning = ann.get('reasoning', 'No description available')
+            annotation_block = f"\n\n> **Image Analysis:**\n> - Category: {category}\n> - Confidence: {confidence}\n> - Reasoning: {reasoning}"
+        
         # Replace image references like ![img-0.jpeg](img-0.jpeg)
-        # with ![img-0.jpeg](images/pdf_name/page1_img-0.jpeg)
+        # with ![img-0.jpeg](<images/pdf_name/page1_img-0.jpeg>) using angle brackets
         pattern = rf'!\[([^\]]*)\]\({re.escape(original_ref)}\)'
-        replacement = f'![\\1]({new_path})'
+        replacement = f'![\\1](<{new_path}>){annotation_block}'
         updated_markdown = re.sub(pattern, replacement, updated_markdown)
         
         # Also handle cases where just the filename is referenced
         pattern2 = rf'\]\({re.escape(original_ref)}\)'
-        replacement2 = f']({new_path})'
+        replacement2 = f'](<{new_path}>)'
         updated_markdown = re.sub(pattern2, replacement2, updated_markdown)
     
     return updated_markdown
 
 
-def extract_markdown_from_response(ocr_response, image_mapping: dict = None) -> str:
+def extract_markdown_from_response(ocr_response, image_mapping: dict = None, annotations: dict = None) -> str:
     """
     Extract and combine markdown content from all pages.
     
     Args:
         ocr_response: OCR API response object
         image_mapping: Optional mapping of image references to file paths
+        annotations: Optional mapping of image IDs to annotation data
         
     Returns:
         str: Combined markdown content from all pages
@@ -419,7 +479,7 @@ def extract_markdown_from_response(ocr_response, image_mapping: dict = None) -> 
         
         # Update image references if mapping provided
         if image_mapping:
-            page_markdown = update_markdown_with_images(page_markdown, image_mapping)
+            page_markdown = update_markdown_with_images(page_markdown, image_mapping, annotations)
         
         markdown_parts.append(page_markdown)
     
@@ -483,6 +543,7 @@ def process_single_pdf(
     log_data: dict,
     sleep_seconds: float,
     preserve_images: bool = False,
+    annotate_images: bool = False,
     current_file: int = 1,
     total_files: int = 1
 ) -> tuple[list[str], int, int]:
@@ -542,22 +603,25 @@ def process_single_pdf(
         
         try:
             # Process with OCR
-            ocr_response = process_pdf_with_ocr(client, chunk_path, include_images=preserve_images)
+            ocr_response = process_pdf_with_ocr(client, chunk_path, include_images=preserve_images, annotate_images=annotate_images)
             
             # Save images if requested
             image_mapping = {}
+            annotations = {}
             images_saved = 0
             if preserve_images:
                 print(f"  🖼️  Extracting images...")
-                image_mapping = save_images_from_response(ocr_response, output_dir, pdf_base_name)
+                image_mapping, annotations = save_images_from_response(ocr_response, output_dir, pdf_base_name)
                 images_saved = len(image_mapping)
                 if images_saved > 0:
                     print(f"  ✅ Saved {images_saved} image(s)")
+                    if annotations:
+                        print(f"  📝 Generated {len(annotations)} annotation(s)")
                 else:
                     print(f"  ℹ️  No images found in this document")
             
             # Extract markdown
-            markdown_content = extract_markdown_from_response(ocr_response, image_mapping)
+            markdown_content = extract_markdown_from_response(ocr_response, image_mapping, annotations)
             
             # Save output
             save_markdown(markdown_content, output_path)
@@ -682,6 +746,18 @@ def main():
     if preserve_images:
         print(f"  ✓ Images will be saved to: {os.path.join(output_path, IMAGES_FOLDER)}/")
     
+    # Ask about image annotation (only if preserving images and pydantic is available)
+    annotate_images = False
+    if preserve_images:
+        if PYDANTIC_AVAILABLE:
+            print()
+            annotate_input = input("Annotate images with AI classification? (yes/no, default: no): ").strip().lower()
+            annotate_images = annotate_input in ['yes', 'y']
+            if annotate_images:
+                print("  ✓ Images will be annotated with category, confidence, and reasoning")
+        else:
+            print("  ℹ️  Image annotation requires pydantic. Install with: pip install pydantic")
+    
     # Get sleep timer
     print()
     sleep_input = input("Enter sleep time between API calls in seconds (default: 1): ").strip()
@@ -735,6 +811,7 @@ def main():
         output_files, pages, images = process_single_pdf(
             client, pdf_path, output_path, log_data, sleep_seconds,
             preserve_images=preserve_images,
+            annotate_images=annotate_images,
             current_file=i + 1,
             total_files=len(pdf_files)
         )
