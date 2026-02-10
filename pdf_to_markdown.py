@@ -259,6 +259,8 @@ def split_pdf_if_needed(pdf_path: str, max_size_bytes: int = MAX_FILE_SIZE_BYTES
     chunk_num = 1
     temp_dir = tempfile.mkdtemp(prefix="pdf_split_")
     
+    print(f"    Splitting into chunks of ~{pages_per_chunk} pages each...")
+    
     for start_page in range(0, total_pages, pages_per_chunk):
         end_page = min(start_page + pages_per_chunk, total_pages)
         
@@ -273,17 +275,8 @@ def split_pdf_if_needed(pdf_path: str, max_size_bytes: int = MAX_FILE_SIZE_BYTES
         with open(chunk_path, 'wb') as f:
             writer.write(f)
         
-        # Check if chunk is still too large, reduce pages if needed
-        chunk_size = get_file_size_bytes(chunk_path)
-        if chunk_size >= max_size_bytes and end_page - start_page > 1:
-            # Chunk is too large, we need to reduce pages
-            os.remove(chunk_path)
-            # Recursively split with fewer pages
-            pages_per_chunk = max(1, pages_per_chunk // 2)
-            continue
-        
         chunks.append(chunk_path)
-        print(f"    Created chunk {chunk_num}: pages {start_page + 1}-{end_page} ({get_file_size_mb(chunk_path):.2f} MB)")
+        print(f"    Created chunk {chunk_num}: pages {start_page + 1}-{end_page}")
         chunk_num += 1
     
     return chunks

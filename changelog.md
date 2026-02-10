@@ -1,3 +1,6 @@
+## 0.3.0 (2026-02-10)
+- **Fix bug - unable to split large PDFs**: split large PDFs into a sensible number of chunks based on the calculated average page size from the original file, without verifying (and being fooled by) the inflated split chunk sizes
+
 ## 0.2.0 (2026-02-01)
 ### Added
 - **Image Annotation**: AI-powered image classification with category, confidence, and reasoning
@@ -10,8 +13,6 @@
 - **Markdown Image Paths**: Wrapped paths in angle brackets `<>` to support filenames with spaces and special characters
   - Before: `![img](images/My PDF/page1.jpeg)` (broken)
   - After: `![img](<images/My PDF/page1.jpeg>)` (works)
-
----
 
 ## 0.1.0 (2026-01-28)
 ### Added
